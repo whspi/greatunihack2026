@@ -1,14 +1,15 @@
-import * as dgram from 'dgram';
-import * as net from 'net';
-import * as readline from 'readline';
-import * as crypto from 'crypto';
-import * as os from 'os';
+import os from "os";
+import net from "net";
+import dgram from "dgram";
+import crypto from "crypto";
+import readline from "readline";
+import MapContext from "./map.js";
 // Configuration
 const DISCOVERY_PORT = 41234;
 const BROADCAST_INTERVAL_MS = 3000;
 const PEER_TIMEOUT_MS = 10000;
-class P2PChatApp {
-    peerId = crypto.randomBytes(4).toString('hex');
+class P2PContext {
+    peerId;
     username;
     tcpPort = 0;
     tcpServer;
@@ -16,8 +17,13 @@ class P2PChatApp {
     peers = new Map();
     seenMessages = new Set();
     rl;
-    constructor(username) {
-        this.username = username || `User-${this.peerId}`;
+    #map;
+    constructor(options) {
+        options ||= {};
+        const id = crypto.randomBytes(4).toString('hex');
+        this.#map = new MapContext(options.mapWidth || 100, options.mapHeight || 80, options.viewDistance || 5);
+        this.peerId = id;
+        this.username = options.username || "User-" + id;
     }
     async start() {
         await this.startTcpServer();
@@ -186,7 +192,8 @@ class P2PChatApp {
                 this.seenMessages.delete(first);
         }
         if (msg.type === 'chat' && msg.payload) {
-            this.renderIncomingMessage(msg.senderName, msg.payload);
+            const { x, y } = JSON.parse(msg.payload);
+            this.#map.setVisited(x, y);
             // Associate socket if not already linked
             const peer = this.peers.get(msg.senderId);
             if (peer && !peer.socket && socket) {
@@ -220,15 +227,20 @@ class P2PChatApp {
         });
         this.rl.on('line', (line) => {
             const text = line.trim();
-            if (!text) {
-                this.rl.prompt();
-                return;
-            }
-            if (text.startsWith('/')) {
-                this.handleCommand(text);
-            }
-            else {
-                this.broadcastChat(text);
+            if (text.length > 0) {
+                if (text[0] === "/")
+                    this.handleCommand(text);
+                else {
+                    const [x, y] = text.split(",", 2);
+                    const rx = parseFloat(x.trim()) || -100;
+                    const ry = parseFloat(y.trim()) || -100;
+                    if (rx < 0 || ry < 0)
+                        console.error("Invalid coordinate.");
+                    else {
+                        this.#map.setVisited(rx, ry);
+                        this.broadcastChat(JSON.stringify({ x, y }, void 0, "\t"));
+                    }
+                }
             }
             this.rl.prompt();
         });
@@ -267,15 +279,12 @@ class P2PChatApp {
             case 'exit':
                 this.rl.close();
                 break;
+            case "map":
+                console.log("Map: \r\n", this.#map.toString());
+                break;
             default:
                 this.logSystem(`Unknown command: /${command}`);
         }
-    }
-    renderIncomingMessage(sender, text) {
-        readline.cursorTo(process.stdout, 0);
-        readline.clearLine(process.stdout, 0);
-        console.log(`\x1b[36m[${sender}]\x1b[0m ${text}`);
-        this.rl.prompt(true);
     }
     logSystem(text) {
         readline.cursorTo(process.stdout, 0);
@@ -285,7 +294,4 @@ class P2PChatApp {
             this.rl.prompt(true);
     }
 }
-// Entrypoint
-const usernameArg = process.argv[2];
-const app = new P2PChatApp(usernameArg);
-app.start();
+await new P2PContext().start();
