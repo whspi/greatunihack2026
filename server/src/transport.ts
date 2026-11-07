@@ -1,5 +1,5 @@
 
-// transport.js — serverless peer-to-peer messaging over a local network.
+// transport.ts — serverless peer-to-peer messaging over a local network.
 //
 // No internet, no broker, no central server. Every agent joins a UDP multicast
 // group on whatever local network exists (venue Wi-Fi, a phone hotspot with
@@ -17,18 +17,63 @@ import { EventEmitter } from 'node:events';
 const DEFAULT_GROUP = '239.255.42.99'; // "administratively scoped" multicast: stays on the local network
 const DEFAULT_PORT = 41234;
 
-export class UdpTransport extends EventEmitter {
+/** Every packet on the wire looks like this. */
+export interface Packet<B = unknown> {
+	v: 1;
+	from: string;
+	seq: number;
+	t: number;
+	type: string;
+	body: B;
+}
+
+export interface PacketMeta {
+	address: string;
+	port: number;
+}
+
+export interface PeerInfo {
+	address: string;
+	lastSeen: number;
+}
+
+export type PeerEvent =
+	| { id: string; status: 'joined'; address: string }
+	| { id: string; status: 'lost' };
+
+export interface TransportOptions {
+	/** this agent's id */
+	id: string;
+	/** multicast group */
+	group?: string;
+	/** UDP port shared by all agents */
+	port?: number;
+	/** how often to announce "I'm here" */
+	heartbeatMs?: number;
+	/** forget a peer after this much silence */
+	peerTimeoutMs?: number;
 	/**
-	 * @param {object} opts
-	 * @param {string} opts.id                  this agent's id
-	 * @param {string} [opts.group]             multicast group
-	 * @param {number} [opts.port]              UDP port shared by all agents
-	 * @param {number} [opts.heartbeatMs]       how often to announce "I'm here"
-	 * @param {number} [opts.peerTimeoutMs]     forget a peer after this much silence
-	 * @param {(msg, meta) => boolean} [opts.radioFilter]
-	 *        optional receive-side filter, e.g. simulated range / line of sight.
-	 *        Return false to drop the packet as if the radio never heard it.
+	 * Optional receive-side filter, e.g. simulated range / line of sight.
+	 * Return false to drop the packet as if the radio never heard it.
 	 */
+	radioFilter?: (msg: Packet, meta: PacketMeta) => boolean;
+}
+
+export class UdpTransport extends EventEmitter {
+	readonly id: string;
+	readonly group: string;
+	readonly port: number;
+	readonly heartbeatMs: number;
+	readonly peerTimeoutMs: number;
+	radioFilter: (msg: Packet, meta: PacketMeta) => boolean;
+	readonly peers = new Map<string, PeerInfo>();
+	offline = false; // set true to simulate "radio off" for this agent
+
+	private seq = 0;
+	private sock?: dgram.Socket;
+	private hb?: NodeJS.Timeout;
+	private sweep?: NodeJS.Timeout;
+
 	constructor({
 		id,
 		group = DEFAULT_GROUP,
@@ -36,7 +81,7 @@ export class UdpTransport extends EventEmitter {
 		heartbeatMs = 1000,
 		peerTimeoutMs = 4000,
 		radioFilter = () => true,
-	}) {
+	}: TransportOptions) {
 		super();
 		if (!id) throw new Error('id is required');
 		this.id = String(id);
@@ -45,27 +90,25 @@ export class UdpTransport extends EventEmitter {
 		this.heartbeatMs = heartbeatMs;
 		this.peerTimeoutMs = peerTimeoutMs;
 		this.radioFilter = radioFilter;
-		this.peers = new Map(); // id -> { address, lastSeen }
-		this.seq = 0;
-		this.offline = false; // set true to simulate "radio off" for this agent
 	}
 
-	start() {
+	start(): Promise<void> {
 		return new Promise((resolve, reject) => {
 			// reuseAddr lets several agents share one port, including on one laptop.
-			this.sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-			this.sock.on('error', (err) => {
+			const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+			this.sock = sock;
+			sock.on('error', (err: Error) => {
 				this.emit('error', err);
 				reject(err);
 			});
-			this.sock.on('message', (buf, rinfo) => this.#receive(buf, rinfo));
-			this.sock.bind(this.port, () => {
+			sock.on('message', (buf: Buffer, rinfo: dgram.RemoteInfo) => this.#receive(buf, rinfo));
+			sock.bind(this.port, () => {
 				try {
 					for (const iface of localIPv4Interfaces()) {
-						try { this.sock.addMembership(this.group, iface); } catch { /* interface may not support multicast */ }
+						try { sock.addMembership(this.group, iface); } catch { /* interface may not support multicast */ }
 					}
-					this.sock.setMulticastTTL(1);         // never leave the local network
-					this.sock.setMulticastLoopback(true); // agents on the same machine hear each other
+					sock.setMulticastTTL(1);         // never leave the local network
+					sock.setMulticastLoopback(true); // agents on the same machine hear each other
 				} catch (err) {
 					return reject(err);
 				}
@@ -78,58 +121,65 @@ export class UdpTransport extends EventEmitter {
 	}
 
 	/** Send to everyone in range. `type` is free-form, `body` must be JSON-serialisable. */
-	send(type, body = {}) {
+	send(type: string, body: unknown = {}): void {
 		if (this.offline || !this.sock) return;
-		const packet = JSON.stringify({ v: 1, from: this.id, seq: ++this.seq, t: Date.now(), type, body });
-		const buf = Buffer.from(packet);
+		const packet: Packet = { v: 1, from: this.id, seq: ++this.seq, t: Date.now(), type, body };
+		const buf = Buffer.from(JSON.stringify(packet));
 		if (buf.length > 60000) throw new Error(`message too large for one UDP packet: ${buf.length} bytes`);
 		this.sock.send(buf, this.port, this.group);
 	}
 
-	onMessage(cb) { this.on('message', cb); return this; }
-	onPeer(cb) { this.on('peer', cb); return this; }
+	onMessage(cb: (msg: Packet, meta: PacketMeta) => void): this { this.on('message', cb); return this; }
+	onPeer(cb: (ev: PeerEvent) => void): this { this.on('peer', cb); return this; }
 
-	setOffline(offline) {
+	setOffline(offline: boolean): void {
 		this.offline = offline;
+		if (offline) {
+			// radio off: we can no longer hear anyone, so drop peers now rather than waiting for the timeout
+			for (const id of [...this.peers.keys()]) {
+				this.peers.delete(id);
+				this.emit('peer', { id, status: 'lost' } satisfies PeerEvent);
+			}
+		}
 		this.emit('radio', offline ? 'off' : 'on');
 	}
 
-	stop() {
+	stop(): void {
 		clearInterval(this.hb);
 		clearInterval(this.sweep);
 		try { this.sock?.close(); } catch { /* already closed */ }
 	}
 
-	#heartbeat() { this.send('hello'); }
+	#heartbeat(): void { this.send('hello'); }
 
-	#receive(buf, rinfo) {
+	#receive(buf: Buffer, rinfo: dgram.RemoteInfo): void {
 		if (this.offline) return; // our own radio is off: we hear nothing
-		let msg;
+		let msg: Packet;
 		try { msg = JSON.parse(buf.toString()); } catch { return; }
 		if (msg?.v !== 1 || !msg.from || msg.from === this.id) return; // ignore junk and our own echo
-		const meta = { address: rinfo.address, port: rinfo.port };
+		const meta: PacketMeta = { address: rinfo.address, port: rinfo.port };
 		if (!this.radioFilter(msg, meta)) return;
 
 		const known = this.peers.has(msg.from);
 		this.peers.set(msg.from, { address: rinfo.address, lastSeen: Date.now() });
-		if (!known) this.emit('peer', { id: msg.from, status: 'joined', address: rinfo.address });
+		if (!known) this.emit('peer', { id: msg.from, status: 'joined', address: rinfo.address } satisfies PeerEvent);
 
 		if (msg.type !== 'hello') this.emit('message', msg, meta);
 	}
 
-	#expirePeers() {
+	#expirePeers(): void {
 		const now = Date.now();
 		for (const [id, p] of this.peers) {
 			if (now - p.lastSeen > this.peerTimeoutMs) {
 				this.peers.delete(id);
-				this.emit('peer', { id, status: 'lost' });
+				this.emit('peer', { id, status: 'lost' } satisfies PeerEvent);
 			}
 		}
 	}
 }
 
-function localIPv4Interfaces() {
-	const out = [];
+function localIPv4Interfaces(): string[] {
+	const out: string[] = [];
 	for (const addrs of Object.values(os.networkInterfaces())) {
 		for (const a of addrs ?? []) if (a.family === 'IPv4') out.push(a.address);
 	}

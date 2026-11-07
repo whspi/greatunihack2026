@@ -1,5 +1,10 @@
 {
 	"type": "module",
+	"scripts": {
+		"build": "tsc -p server/src",
+		"agent": "tsc -p server/src && node server/out/agent.js",
+		"server": "tsc -p server/src && node server/out/main.js"
+	},
 	"devDependencies": {
 		"@types/node": "^26.6.6",
 		"typescript": "^7.0.2"
